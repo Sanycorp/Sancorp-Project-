@@ -658,21 +658,40 @@ class PhaseBlackHole(Phase):
                 * np.float32(0.034)).astype(F32)
 
         # a light blur so the table does not alias into hard squares
-        tab = (tab * 0.52
-               + np.roll(tab, 1, axis=1) * 0.12
-               + np.roll(tab, -1, axis=1) * 0.12
-               + np.roll(tab, 1, axis=0) * 0.12
-               + np.roll(tab, -1, axis=0) * 0.12).astype(F32)
+        tab = (tab * 0.64
+               + np.roll(tab, 1, axis=1) * 0.09
+               + np.roll(tab, -1, axis=1) * 0.09
+               + np.roll(tab, 1, axis=0) * 0.09
+               + np.roll(tab, -1, axis=0) * 0.09).astype(F32)
         return tab
 
     def sample_sky(self, dirs):
+        """Bilinear lookup into the background table.
+
+        Bilinear and not nearest: gravitational lensing *magnifies*, and
+        near the Einstein ring it magnifies enormously, so a single texel
+        of the sky can be stretched across dozens of pixels.  With nearest
+        sampling that turns the lensed star field into a mosaic of hard
+        coloured squares — visible, and the single most conspicuous
+        artefact in the most important shot of the film.
+        """
         tab = self._sky_tab
         h, w, _ = tab.shape
         theta = np.arccos(np.clip(dirs[:, 1], -1.0, 1.0))
         phi = np.arctan2(dirs[:, 2], dirs[:, 0])
-        iy = np.clip((theta / math.pi * h).astype(np.int32), 0, h - 1)
-        ix = np.clip(((phi / TAU + 0.5) * w).astype(np.int32), 0, w - 1)
-        return tab[iy, ix]
+        fy = np.clip(theta / math.pi * h - 0.5, 0.0, h - 1.001)
+        fx = (phi / TAU + 0.5) * w - 0.5
+        fx = np.mod(fx, w)
+        y0 = fy.astype(np.int32)
+        x0 = fx.astype(np.int32)
+        y1 = np.minimum(y0 + 1, h - 1)
+        x1 = (x0 + 1) % w            # the sky wraps in longitude
+        wy = (fy - y0).astype(F32)[:, None]
+        wx = (fx - x0).astype(F32)[:, None]
+        return (tab[y0, x0] * (1 - wy) * (1 - wx)
+                + tab[y0, x1] * (1 - wy) * wx
+                + tab[y1, x0] * wy * (1 - wx)
+                + tab[y1, x1] * wy * wx)
 
     # ----------------------------------------------------------------
     def camera_at(self, ctx, lt):

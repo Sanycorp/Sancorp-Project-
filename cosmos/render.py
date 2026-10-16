@@ -75,11 +75,11 @@ def ffmpeg_binary():
 #: a thin photon ring, so it is marched much closer to full resolution even
 #: though its rays are by far the most expensive.
 QUALITY = {
-    "I · GALAKSI":     dict(march=0.3334, steps=64),
+    "I · GALAKSI":     dict(march=0.3125, steps=58),
     "II · TATA SURYA": dict(march=1.0, steps=1),
-    "III · MATAHARI":  dict(march=0.5, steps=56),
-    "IV · TRANSISI":   dict(march=0.4167, steps=44),
-    "V · LUBANG HITAM": dict(march=0.4167, steps=1),
+    "III · MATAHARI":  dict(march=0.3334, steps=48),
+    "IV · TRANSISI":   dict(march=0.3334, steps=38),
+    "V · LUBANG HITAM": dict(march=0.3959, steps=1),
 }
 
 

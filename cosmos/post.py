@@ -147,7 +147,7 @@ def bright_pass(img, threshold, knee=0.55):
     return img * w[:, :, None]
 
 
-def glare(img, threshold=0.78, strength=0.30, levels=6, ana=0.34,
+def glare(img, threshold=0.78, strength=0.30, levels=5, ana=0.34,
           halation=0.22):
     """Lens and sensor glare: a bloom pyramid, a streak, and halation.
 
@@ -155,14 +155,22 @@ def glare(img, threshold=0.78, strength=0.30, levels=6, ana=0.34,
     then sum the levels back up with decreasing weight — which produces a
     glow whose profile falls off over several octaves of scale rather than
     the single Gaussian lobe a one-pass blur gives.
+
+    Every part of it is computed on a half-resolution copy and upsampled
+    once at the end.  Glare is by definition low-frequency, so the only
+    thing full-resolution work buys is a quarter of the frame rate: at
+    1920x1080 the naive version of this function cost 1.4 seconds a frame,
+    which across the whole film was more than the galaxy phase.
     """
     bp = bright_pass(img, threshold)
-    if float(bp.max()) <= 1e-6:
+    peak = float(bp.max())
+    if peak <= 1e-6:
         return img
 
-    acc = np.zeros_like(img)
-    cur = bp
-    shapes = [img.shape]
+    half = downsample2(bp)
+    shapes = [half.shape]
+    acc = np.zeros_like(half)
+    cur = half
     pyramid = []
     for i in range(levels):
         if min(cur.shape[0], cur.shape[1]) < 8:
@@ -180,38 +188,34 @@ def glare(img, threshold=0.78, strength=0.30, levels=6, ana=0.34,
             up = blur(up, 2, passes=1)
         acc += up * F32(0.72 ** i)
 
-    out = img + acc * F32(strength)
+    acc *= F32(strength)
 
     # --- anamorphic streak -------------------------------------------
     # A cylindrical front element spreads a point into a horizontal line.
-    # The effect is applied to a heavily reduced copy because the streak is
-    # by definition low frequency.
     if ana > 0.0:
-        small = downsample2(downsample2(bp))
+        small = downsample2(downsample2(half))
         w = small.shape[1]
-        streak = box_blur_h(small, max(4, w // 22))
-        streak = box_blur_h(streak, max(4, w // 44))
+        streak = box_blur_h(small, max(4, w // 11))
+        streak = box_blur_h(streak, max(4, w // 22))
         streak = box_blur_v(streak, 1)
-        streak = upsample2(upsample2(streak, shapes[1] if len(shapes) > 1
-                                     else img.shape), img.shape)
-        streak = blur(streak, 2, passes=1)
+        streak = upsample2(upsample2(streak, shapes[1]), shapes[0])
         tint = np.array([0.74, 0.86, 1.0], F32)
-        out += streak * tint[None, None, :] * F32(ana)
+        acc += streak * tint[None, None, :] * F32(ana)
 
     # --- halation ------------------------------------------------------
     # In film, light that gets through the emulsion reflects off the base
     # and re-exposes it from behind.  Red light penetrates deepest, so the
-    # halo around a highlight is warm.  Digital sensors do something
-    # similar through the substrate.
+    # halo around a highlight is warm.
     if halation > 0.0:
-        small = downsample2(downsample2(bp))
-        hal = blur(small, max(3, small.shape[1] // 60), passes=2)
-        hal = upsample2(upsample2(hal, shapes[1] if len(shapes) > 1
-                                  else img.shape), img.shape)
+        small = downsample2(downsample2(half))
+        hal = blur(small, max(3, small.shape[1] // 30), passes=2)
+        hal = upsample2(upsample2(hal, shapes[1]), shapes[0])
         tint = np.array([1.0, 0.42, 0.22], F32)
-        out += hal * tint[None, None, :] * F32(halation)
+        acc += hal * tint[None, None, :] * F32(halation)
 
-    return out
+    acc = upsample2(acc, img.shape)
+    acc = blur(acc, 2, passes=1)
+    return img + acc
 
 
 # ==========================================================================
@@ -220,27 +224,32 @@ def glare(img, threshold=0.78, strength=0.30, levels=6, ana=0.34,
 def _radial_scale(channel, amount):
     """Scale one channel about the image centre by ``1 + amount``.
 
-    Implemented as a gather with bilinear weights computed once per call;
-    at these magnitudes a nearest-neighbour gather visibly steps, and a
-    full resampling library is not available.
+    Separable: the rows are resampled, then the columns.  A 2-D bilinear
+    gather needs four full-frame fancy-index reads and three full-frame
+    multiply-adds; doing it as two 1-D passes needs two of each, and since
+    a pure scale about the centre *is* separable the result is identical
+    to the floating-point noise.
     """
     h, w = channel.shape
     if abs(amount) < 1e-7:
         return channel
-    cy, cx = (h - 1) * 0.5, (w - 1) * 0.5
-    ys = (np.arange(h, dtype=np.float32) - cy) / (1.0 + amount) + cy
-    xs = (np.arange(w, dtype=np.float32) - cx) / (1.0 + amount) + cx
-    np.clip(ys, 0, h - 1.001, out=ys)
+    inv = 1.0 / (1.0 + amount)
+
+    cx = (w - 1) * 0.5
+    xs = (np.arange(w, dtype=np.float32) - cx) * inv + cx
     np.clip(xs, 0, w - 1.001, out=xs)
-    y0 = ys.astype(np.int32); x0 = xs.astype(np.int32)
-    fy = (ys - y0)[:, None]; fx = (xs - x0)[None, :]
-    y1 = np.minimum(y0 + 1, h - 1); x1 = np.minimum(x0 + 1, w - 1)
-    a = channel[np.ix_(y0, x0)]
-    b = channel[np.ix_(y0, x1)]
-    c = channel[np.ix_(y1, x0)]
-    d = channel[np.ix_(y1, x1)]
-    return (a * (1 - fy) * (1 - fx) + b * (1 - fy) * fx
-            + c * fy * (1 - fx) + d * fy * fx).astype(F32)
+    x0 = xs.astype(np.int32)
+    fx = (xs - x0).astype(F32)[None, :]
+    x1 = np.minimum(x0 + 1, w - 1)
+    tmp = channel[:, x0] * (F32(1.0) - fx) + channel[:, x1] * fx
+
+    cy = (h - 1) * 0.5
+    ys = (np.arange(h, dtype=np.float32) - cy) * inv + cy
+    np.clip(ys, 0, h - 1.001, out=ys)
+    y0 = ys.astype(np.int32)
+    fy = (ys - y0).astype(F32)[:, None]
+    y1 = np.minimum(y0 + 1, h - 1)
+    return (tmp[y0] * (F32(1.0) - fy) + tmp[y1] * fy).astype(F32)
 
 
 def chromatic(img, amount=0.0018):
@@ -343,9 +352,12 @@ def grain(img_u8, rng, amount=3.4):
     if amount <= 0.0:
         return img_u8
     h, w = img_u8.shape[:2]
-    n = rng.standard_normal((h, w), dtype=np.float32)
-    # one box pass gives the grain a little clumping instead of pure noise
-    n = box_blur_h(n[:, :, None], 1)[:, :, 0]
+    # Generated at half resolution and doubled.  Real grain clumps — the
+    # developed silver crystals are larger than a scanned pixel — so the
+    # pairing is a feature, and drawing two million gaussians per frame
+    # instead of half a million was costing more than the tone map.
+    n = rng.standard_normal((h // 2 + 1, w // 2 + 1), dtype=np.float32)
+    n = np.repeat(np.repeat(n, 2, axis=0), 2, axis=1)[:h, :w]
     l = img_u8[:, :, 1].astype(np.float32) * (1.0 / 255.0)
     weight = 4.0 * l * (1.0 - l)
     d = (n * weight * amount)[:, :, None]
