@@ -1,8 +1,15 @@
 # render scratch
 .rendertmp/
+.rendertmp2/
 preview/
 __pycache__/
 *.pyc
 
 # generated audio stem (rebuild with: python3 src/audio.py out/score.wav)
 out/*.wav
+
+# baked volume cache (rebuild with: python3 -m cosmos.core.vcache)
+.volcache/
+
+# cosmic sequence master (180 MB; delivered via Drive, not via git)
+out/cosmos_1080p60.mp4
