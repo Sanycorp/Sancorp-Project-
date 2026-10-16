@@ -800,8 +800,8 @@ class PhaseSun(Phase):
         u = self.progress(lt, self.duration)
         close = V.smootherstep(0.18, 0.56, u)        # diving in
         out = V.smootherstep(0.62, 1.0, u)           # pulling back
-        ev = 0.90 * (1.0 - close) + 0.40 * close
-        ev = ev * (1.0 - out) + 3.4 * out
+        ev = 0.62 * (1.0 - close) + 0.30 * close
+        ev = ev * (1.0 - out) + 2.1 * out
         return float(ev)
 
     # ----------------------------------------------------------------

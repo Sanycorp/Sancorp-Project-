@@ -103,7 +103,7 @@ class TransitParams:
     beta_max: float = 0.88           # peak speed as a fraction of c
     r_outer: float = 900.0           # how far the shot travels, AU
 
-    n_field_stars: int = 60000
+    n_field_stars: int = 36000
 
 
 def heliosphere_radius(dirs, p: TransitParams):
@@ -147,7 +147,13 @@ class RelativisticSky:
         lum = S.luminosity_from_mass(mass)
         b = np.power(np.maximum(lum, 1e-6), 0.34).astype(F32)
         b *= rng.lognormal(0.0, 0.42, n).astype(F32)
-        self.rest_flux = (b / np.percentile(b, 99.0)).astype(F32)
+        b = (b / np.percentile(b, 99.5)).astype(F32)
+        # Steepened hard.  A real sky is a few dozen obvious stars over a
+        # haze of ones you cannot quite see; a field where every star has
+        # a similar brightness reads as sensor noise, which is exactly what
+        # the flatter distribution produced here.
+        self.rest_flux = (np.power(np.clip(b, 0.0, 4.0), F32(3.1))
+                          * F32(1.35)).astype(F32)
 
         # a handful of nearby bright stars that will show real parallax
         m = 220
@@ -276,19 +282,43 @@ class TransitShader:
         r_bw = F32(p.r_bowwave) * (F32(1.0) + tail * F32(0.4))
 
         # ---- texture ----------------------------------------------------
-        n1 = self._unit(self.v_neb.sample(pos * F32(0.0042) + self._drift
+        # Low sampling frequencies: the march spans thousands of scene
+        # units, and anything above about a hundredth of a cycle per unit
+        # wraps the periodic volume enough times to print its own tiling
+        # across the sky as a lattice of creases.
+        n1 = self._unit(self.v_neb.sample(pos * F32(0.00085) + self._drift
                                           * F32(0.001), jitter=self.jitter))
-        n2 = self._unit(self.v_fine.sample(pos * F32(0.021),
+        n2 = self._unit(self.v_fine.sample(pos * F32(0.0045),
                                            jitter=self.jitter))
-        fil = self.v_fil.sample(pos * F32(0.0085), jitter=self.jitter)
+        fil = self.v_fil.sample(pos * F32(0.0019), jitter=self.jitter)
+        # Angular texture for the shells.  A shell seen from inside covers
+        # the entire sky, so without structure that varies with *direction*
+        # it contributes the same radiance to every pixel and the frame
+        # turns into flat grey no matter how faint it is.  Sampling on the
+        # unit sphere of directions gives it the mottled, ribbed look the
+        # IBEX maps of the heliosphere boundary actually have.
+        shell_tex = np.clip(
+            self.v_fil.sample(dirs * F32(2.6), jitter=self.jitter)
+            * F32(2.1) - F32(0.42), F32(0.0), F32(1.8))
+        shell_tex *= F32(0.45) + F32(0.85) * np.clip(
+            self.v_fil.sample(dirs * F32(7.3), jitter=self.jitter)
+            * F32(1.6), F32(0.0), F32(1.2))
 
         # ---- solar wind, inside the termination shock -------------------
         # Density of a freely expanding wind falls as 1/r^2 by mass
         # conservation alone: the same mass flux through an ever larger
         # sphere.
         wind = (F32(p.r_termination) * inv_r) ** 2
+        # Capped, because the 1/r^2 law is exact and therefore ruinous: at
+        # fifteen astronomical units it is forty times its value at the
+        # shock, and since a march step out here is tens of AU long that
+        # alone saturates the frame.  The wind is a near-vacuum anyway —
+        # five particles per cubic centimetre at Earth — so what is being
+        # drawn is a visualisation of its density, and a visualisation may
+        # be clipped where the quantity itself cannot.
+        np.minimum(wind, F32(5.0), out=wind)
         wind *= np.clip((r_ts - r) * F32(0.055), 0.0, 1.0)
-        wind *= F32(0.55) + F32(0.75) * n2
+        wind *= F32(0.18) + F32(0.26) * n2
 
         # ---- termination shock ------------------------------------------
         # The wind is supersonic inside and subsonic outside; the jump is
@@ -311,24 +341,47 @@ class TransitShader:
         bow *= F32(0.3) + F32(1.0) * n1
 
         # ---- the local interstellar cloud --------------------------------
-        # Outside everything: cold, clumpy, barely luminous, and it has to
-        # keep going when the heliosphere is far behind.
-        ism = np.clip((r - r_hp) * F32(0.012), 0.0, 1.0)
-        cloud = n1 * F32(0.55) + fil * F32(0.28) + n2 * F32(0.17)
-        cloud = np.maximum(cloud - F32(0.40), F32(0.0))
+        # The honest answer for this volume is *almost nothing*.  The local
+        # cloud holds about a tenth of an atom per cubic centimetre; it is
+        # emptier than the best vacuum any laboratory has produced, and it
+        # emits essentially no visible light of its own.  An earlier
+        # version filled it with glowing nebulosity and the result was a
+        # brown fog that buried the one thing this phase exists to show.
+        # What survives is a very sparse scatter of denser knots.
+        ism = np.clip((r - r_hp) * F32(0.010), 0.0, 1.0)
+        cloud = n1 * F32(0.60) + fil * F32(0.25) + n2 * F32(0.15)
+        cloud = np.maximum(cloud - F32(0.62), F32(0.0))
         cloud *= cloud
-        ism = ism * cloud * F32(3.1)
+        ism = ism * cloud * F32(2.4)
 
         sw = F32(self._shock)
-        hot = (wind * F32(1.25) + shock * F32(2.1) + sheath * F32(0.75)) * sw
-        cold = (wall * F32(1.35) * sw + bow * F32(0.9) * sw + ism)
+        # Only the *boundaries* are drawn.  The volumes between them are
+        # transparent, which is the physically honest answer and also the
+        # only one that works: the camera starts inside the heliosphere, so
+        # every ray crosses the entire bubble, and any filled interior
+        # integrates into a flat grey fog across the whole frame no matter
+        # how faint it is per unit length.  A shock is a surface; drawing
+        # it as a surface is both cheaper and truer.
+        hot = (wind * F32(0.035) + shock * F32(1.30) * shell_tex
+               + sheath * F32(0.055)) * sw
+        cold = (wall * F32(0.85) * shell_tex * sw
+                + bow * F32(0.50) * shell_tex * sw
+                + ism * F32(0.22))
 
+        # The gains below look absurdly small and are not.  One scene
+        # unit here is an astronomical unit and the march spans well over a
+        # thousand of them, so a step is of order fifty units long: an
+        # emission coefficient tuned by eye at unit scale overexposes the
+        # frame by two orders of magnitude.  What matters is the ratio of
+        # these to the extinction coefficient below, because the marcher
+        # integrates the source function, and that ratio is what sets the
+        # radiance a saturated column reaches.
         emis = ramp_lookup(self.ramp_wind,
                            np.clip(hot * F32(0.55), 0.0, 1.0)) \
-            * (hot * F32(0.085))[:, None]
+            * (hot * F32(0.0022))[:, None]
         emis += ramp_lookup(self.ramp_ism,
                             np.clip(cold * F32(0.65), 0.0, 1.0)) \
-            * (cold * F32(0.055))[:, None]
+            * (cold * F32(0.0015))[:, None]
 
         total = hot + cold
         sigma = total * F32(0.0022) + F32(1e-6)
@@ -378,7 +431,7 @@ class PhaseTransit(Phase):
         """
         u = self.progress(lt, self.duration)
         g = V.smootherstep(0.0, 1.0, u)
-        d0, d1 = 14.0, self.p.r_outer
+        d0, d1 = 42.0, self.p.r_outer
         return float(math.exp(math.log(d0) * (1.0 - g) + math.log(d1) * g))
 
     def camera_at(self, ctx, lt):
@@ -403,16 +456,22 @@ class PhaseTransit(Phase):
     def exposure_at(self, ctx, lt):
         u = self.progress(lt, self.duration)
         # the sky gets much brighter under beaming, so stop down
-        return float(1.5 * (1.0 - 0.72 * V.smootherstep(0.25, 0.95, u)))
+        return float(1.35 * (1.0 - 0.45 * V.smootherstep(0.25, 0.95, u)))
 
     # ----------------------------------------------------------------
     def _bounds(self, rays):
         p = self.p
         o, dd = rays.origin, rays.direction
         c = np.zeros(3, F32)
-        # one generous sphere covering the heliosphere, its tail and the
-        # near interstellar medium
-        hit, tn, tf = V.ray_sphere(o, dd, c, F32(p.r_outer * 1.6))
+        # A sphere just large enough to hold the heliosphere, its tail
+        # and the bow wave.  The earlier bound reached out to the far end
+        # of the flight at fourteen hundred units, and the consequence was
+        # that every ray integrated a thousand units of near-empty cloud
+        # and came back with a uniform grey — a vacuum is only invisible
+        # if you stop integrating it.  Past this radius there is nothing
+        # left to draw but stars, which is the correct picture of
+        # interstellar space.
+        hit, tn, tf = V.ray_sphere(o, dd, c, F32(p.r_bowwave * 1.55))
         hit = hit.ravel(); tn = tn.ravel(); tf = tf.ravel()
         rays.t_near = np.maximum(tn, F32(0.05)).astype(F32)
         rays.t_far = np.where(hit, tf, tn - 1.0).astype(F32)
@@ -439,7 +498,7 @@ class PhaseTransit(Phase):
         nose = np.asarray(self.p.nose, F32)
         nose = nose / np.linalg.norm(nose)
         pos, rgb = self.sky.transform(beta, nose, cam.eye)
-        sky, _ = project_and_splat(cam, pos, rgb * F32(0.055),
+        sky, _ = project_and_splat(cam, pos, rgb * F32(0.21),
                                    ctx.width, ctx.height, falloff=False,
                                    size_scale=1.5)
 

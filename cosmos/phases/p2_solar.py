@@ -1276,14 +1276,14 @@ class PhaseSolarSystem(Phase):
             # survive untouched; only the ratio of extremes is squeezed.
             lum = np.maximum(S.luminance(pc), F32(1e-30))
             disp = np.power(lum / F32(self.POINT_REF), F32(0.28))
-            pc = pc * (disp / lum)[:, None] * F32(0.75)
+            pc = pc * (disp / lum)[:, None] * F32(1.35)
             pb, _ = project_and_splat(cam, pp, pc, ctx.width, ctx.height,
                                       falloff=False, size_scale=3.0)
             img += pb.reshape(ctx.height, ctx.width, 3)
 
         bgpos, bgrgb = self._bg
         bb, _ = project_and_splat(cam, bgpos + cam.eye.astype(F32),
-                                  bgrgb * F32(0.065 + 0.010 * exposure),
+                                  bgrgb * F32(0.12 + 0.015 * exposure),
                                   ctx.width, ctx.height, falloff=False)
         img += bb.reshape(ctx.height, ctx.width, 3)
 
