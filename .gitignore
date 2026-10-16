@@ -1,0 +1,8 @@
+# render scratch
+.rendertmp/
+preview/
+__pycache__/
+*.pyc
+
+# generated audio stem (rebuild with: python3 src/audio.py out/score.wav)
+out/*.wav
