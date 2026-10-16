@@ -247,6 +247,56 @@ def echo(buf, time=BEAT * 0.75, fb=0.34, n=4, mix=0.3):
 # --------------------------------------------------------------------------
 # arrangement
 # --------------------------------------------------------------------------
+def reverb_ir(dur=2.4, decay=4.2, seed=5, hi=5200):
+    """Exponentially decaying, high-damped stereo impulse response."""
+    n = int(dur * SR)
+    r = np.random.default_rng(seed)
+    ir = r.standard_normal((n, 2)).astype(np.float32)
+    env = np.exp(-np.arange(n, dtype=np.float32) / SR * decay)
+    env[:int(0.012 * SR)] = 0.0                 # pre-delay
+    ir *= env[:, None]
+    for ch in range(2):
+        ir[:, ch] -= spectral(ir[:, ch], lo=hi) * 0.72   # damp the top end
+    ir /= np.sqrt((ir ** 2).sum(axis=0)).max() + 1e-9
+    return ir
+
+
+def convolve(x, ir):
+    """Fast FFT convolution, length-preserving."""
+    n, m = len(x), len(ir)
+    N = 1
+    while N < n + m:
+        N <<= 1
+    out = np.empty_like(x)
+    for ch in range(2):
+        out[:, ch] = np.fft.irfft(
+            np.fft.rfft(x[:, ch], N) * np.fft.rfft(ir[:, ch], N), N)[:n]
+    return out.astype(np.float32)
+
+
+def widen(x, amount=1.0):
+    """Mid/side stereo widening."""
+    mid = (x[:, 0] + x[:, 1]) * 0.5
+    side = (x[:, 0] - x[:, 1]) * 0.5 * amount
+    out = np.empty_like(x)
+    out[:, 0] = mid + side
+    out[:, 1] = mid - side
+    return out
+
+
+def limit(x, ceiling=0.96, look=0.004, smooth=0.010):
+    """Lookahead peak limiter — transparent where tanh would have dulled
+    every transient in the mix."""
+    env = np.abs(x).max(axis=1)
+    g = np.minimum(1.0, ceiling / np.maximum(env, 1e-9)).astype(np.float32)
+    k = max(1, int(look * SR))
+    g = np.minimum.reduce([np.roll(g, i) for i in range(0, k, 12)])
+    w = np.hanning(max(3, int(smooth * SR) | 1)).astype(np.float32)
+    w /= w.sum()
+    g = np.convolve(g, w, mode="same").astype(np.float32)
+    return x * g[:, None]
+
+
 def build():
     n = int(DUR * SR)
     drums = np.zeros((n, 2), np.float32)
@@ -398,6 +448,17 @@ def build():
             pan=-0.3 + i * 0.2)
     add(fx, impact(3.0, 0.8), 52.0, 0.5)
 
+    # ---------------- bassline ------------------------------------------
+    # roots the harmony an octave below the pads: the mix had a hole between
+    # the sub drone and the chords, which is what made it feel thin
+    for b in sorted(kick_bars):
+        f = hz(chord_at(b)[2])          # PROG rows are (name, voicing, root)
+        while f > 110.0:
+            f *= 0.5
+        for q, (off, dur, g) in enumerate(((0.0, 0.46, 1.0), (1.5, 0.30, 0.62),
+                                           (2.0, 0.46, 0.86), (3.5, 0.26, 0.55))):
+            add(music, bass(f, dur), b * BAR + off * BEAT, 0.50 * g)
+
     # ---------------- glue ----------------------------------------------
     fx = echo(fx, BEAT * 0.75, 0.32, 4, 0.26)
     music = echo(music, BEAT * 1.5, 0.22, 3, 0.16)
@@ -417,7 +478,22 @@ def build():
     music *= duck[:, None]
     fx *= (0.55 + 0.45 * duck)[:, None]
 
-    mix = drums * 0.95 + music * 1.0 + fx * 0.85
+    # reverb sends: the dry buses alone had no room around them
+    IR = reverb_ir(2.4, 4.2)
+    IR_S = reverb_ir(1.1, 9.0, seed=9, hi=6400)
+    music = music + convolve(music, IR) * 0.26
+    fx = fx + convolve(fx, IR_S) * 0.22
+    drums = drums + convolve(drums, IR_S) * 0.07
+
+    music = widen(music, 1.30)
+    fx = widen(fx, 1.18)
+
+    # keep the bottom octave for kick + sub only, so the low end stays tight
+    for ch in range(2):
+        music[:, ch] = spectral(music[:, ch], lo=38)
+        fx[:, ch] = spectral(fx[:, ch], lo=70)
+
+    mix = drums * 0.95 + music * 0.92 + fx * 0.82
 
     # ---------------- master --------------------------------------------
     # gentle high shelf for air
@@ -431,10 +507,13 @@ def build():
     mix[f0:f1] *= np.linspace(1, 0, f1 - f0)[:, None]
     mix[f1:] = 0.0
 
-    # limiter
+    # master: drive into a lookahead limiter, then a soft safety clip
     peak = np.abs(mix).max()
-    mix = np.tanh(mix / max(peak, 1e-6) * 1.35) * 0.90
-    return mix
+    mix = mix / max(peak, 1e-6) * 1.45
+    mix = limit(mix, 0.96)
+    mix = np.tanh(mix * 1.02)
+    mix *= 0.95 / max(np.abs(mix).max(), 1e-6)
+    return mix.astype(np.float32)
 
 
 def write_wav(path, data):

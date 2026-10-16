@@ -30,9 +30,9 @@ BG = (7, 7, 9)
 INK = (12, 12, 15)
 WHITE = (255, 255, 255)
 BONE = (236, 238, 243)
-CRIMSON = (255, 36, 72)
-CRIM_HOT = (255, 92, 118)
-CRIM_DEEP = (142, 10, 32)
+CRIMSON = (255, 26, 54)
+CRIM_HOT = (255, 88, 96)
+CRIM_DEEP = (134, 8, 24)
 EMBER = (255, 146, 82)
 LIME = (200, 255, 70)
 STEEL = (124, 131, 148)
@@ -494,14 +494,26 @@ def screen(canvas: np.ndarray, lyr: Image.Image, gain=1.0):
 
 
 # ==========================================================================
-# post chain
+# post chain — cinematic grade pipeline
+#
+#   scene float32 HDR  ->  glow (bloom pyramid + anamorphic + halation)
+#                      ->  lens (per-channel vignette / scanline / cool edge)
+#                      ->  display() 12-bit LUT  -> 8-bit graded RGB
+#                      ->  warp_ca() camera move + chromatic aberration
+#                      ->  grain_u8()
 # ==========================================================================
 _lens_cache: dict = {}
+_lut_cache: dict = {}
+
+_LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
+
+HDR_MAX = 4.0          # headroom carried into the tone curve
+_LUT_N = 4096
 
 
-def lens(canvas, vig=0.62, scan=0.045, period=3.0):
-    """Combined vignette + scanline multiply (single cached array)."""
-    key = (round(vig, 3), round(scan, 4), round(period, 2))
+def lens(canvas, vig=0.62, scan=0.045, period=3.0, cool=0.06):
+    """Vignette + scanlines + cool corner falloff as one cached per-channel map."""
+    key = (round(vig, 3), round(scan, 4), round(period, 2), round(cool, 3))
     m = _lens_cache.get(key)
     if m is None:
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -509,61 +521,162 @@ def lens(canvas, vig=0.62, scan=0.045, period=3.0):
         dy = (yy - CY) / (H * 0.62)
         r = np.sqrt(dx * dx + dy * dy)
         v = np.clip(1.0 - (r**1.9) * 0.78, 0.0, 1.0)
-        m = 1.0 - vig * (1.0 - v) ** 1.5
+        base = 1.0 - vig * (1.0 - v) ** 1.5
         if scan > 0:
             s = 0.5 + 0.5 * np.cos(np.arange(H, dtype=np.float32) * (2 * math.pi / period))
-            m = m * (1.0 - scan * s[:, None])
-        m = m.astype(np.float32)[..., None]
+            base = base * (1.0 - scan * s[:, None])
+        fall = np.clip(r, 0.0, 1.5) ** 2.0
+        m = np.empty((H, W, 3), np.float32)
+        m[..., 0] = base * (1.0 - cool * 1.00 * fall)
+        m[..., 1] = base * (1.0 - cool * 0.58 * fall)
+        m[..., 2] = base * (1.0 - cool * 0.08 * fall)
         _lens_cache[key] = m
     canvas *= m
     return canvas
 
 
-def bloom(canvas, thresh=0.62, strength=0.52, radius=10.0, down=4):
-    # 2-tap strided downsample: ~35x cheaper than a full box mean and the
-    # result is blurred to oblivion anyway.
-    small = (canvas[::down, ::down] + canvas[down // 2::down, down // 2::down]) * 0.5
-    lum = small.max(axis=2, keepdims=True)
-    k = np.clip((lum - thresh) / (1.0 - thresh + 1e-6), 0.0, 1.0)
-    bright = np.clip(small * k, 0.0, 4.0)
-    im = Image.fromarray(np.clip(bright * 255.0, 0, 255).astype(np.uint8))
-    b1 = im.filter(ImageFilter.GaussianBlur(radius))
-    b2 = b1.filter(ImageFilter.GaussianBlur(radius * 2.6))
-    a1 = np.asarray(b1, np.float32)
-    a2 = np.asarray(b2, np.float32)
-    glow = np.clip(a1 * 0.62 + a2 * 0.72, 0, 255).astype(np.uint8)
-    up = Image.fromarray(glow).resize((W, H), Image.BILINEAR)
-    g = np.asarray(up, np.float32)
-    np.add(canvas, g * np.float32(strength / 255.0), out=canvas)
+def glow(canvas, thresh=0.62, strength=0.26, radius=5.0, down=4,
+         ana=0.28, ana_tint=(0.62, 0.84, 1.0), halo_tint=(1.0, 0.64, 0.56)):
+    """HDR bright pass -> 4-octave bloom pyramid + anamorphic streak + halation.
+
+    The bright pass keeps HDR_MAX stops of headroom, so specular cores bloom
+    far harder than diffuse whites instead of all clipping to the same value.
+    """
+    d = down
+    small = canvas[::d, ::d] + canvas[d // 2::d, d // 2::d]
+    small *= 0.5
+    # Bloom response is mostly photometric: a saturated red is nowhere near as
+    # bright as white, so it must not bloom as if it were.  Pure max() made
+    # every accent fill flare out to pink; this blend keeps reds as reds.
+    mx = small.max(axis=2, keepdims=True)
+    lu = np.einsum("ijk,k->ij", small, _LUMA)[..., None]
+    mx *= np.float32(0.40)
+    mx += lu * np.float32(0.60)
+    k = np.clip((mx - thresh) * np.float32(1.0 / (1.0 - thresh + 1e-6)), 0.0, 1.0)
+    small *= k
+    np.clip(small, 0.0, HDR_MAX, out=small)
+    small *= np.float32(255.0 / HDR_MAX)
+    im = Image.fromarray(small.astype(np.uint8))
+    w, h = im.size
+
+    acc = np.zeros((h, w, 3), np.float32)
+    tints = ((1.0, 1.0, 1.0), (1.0, 0.98, 0.96), (1.0, 0.88, 0.82), halo_tint)
+    cur = im
+    for lv, wt in enumerate((0.66, 0.34, 0.19, 0.12)):
+        cur = cur.filter(ImageFilter.GaussianBlur(radius))
+        up = cur if cur.size == (w, h) else cur.resize((w, h), Image.BILINEAR)
+        t = tints[lv]
+        if t == (1.0, 1.0, 1.0):
+            acc += np.asarray(up, np.float32) * np.float32(wt)
+        else:
+            acc += np.asarray(up, np.float32) * (np.asarray(t, np.float32) * wt)
+        cur = cur.resize((max(2, cur.width // 2), max(2, cur.height // 2)), Image.BILINEAR)
+
+    if ana > 0.004:
+        sq = im.resize((w, max(2, h // 7)), Image.BILINEAR)
+        sq = sq.filter(ImageFilter.GaussianBlur(radius * 3.2))
+        sq = sq.resize((w, h), Image.BILINEAR)
+        acc += np.asarray(sq, np.float32) * (np.asarray(ana_tint, np.float32) * ana)
+
+    np.clip(acc, 0.0, 255.0, out=acc)
+    up = Image.fromarray(acc.astype(np.uint8)).resize((W, H), Image.BILINEAR)
+    np.add(canvas, np.asarray(up, np.float32) * np.float32(strength * HDR_MAX / 255.0),
+           out=canvas)
     return canvas
 
 
-def chroma(canvas, amount):
-    """Radial chromatic aberration; `amount` is roughly pixels at the edge."""
-    if amount < 0.25:
-        return canvas
-    s = 1.0 + amount / 900.0
-    base = Image.fromarray(np.clip(canvas * 255.0, 0, 255).astype(np.uint8))
-    bw, bh = int(W * s), int(H * s)
-    big = base.resize((bw, bh), Image.BILINEAR)
-    ox, oy = (bw - W) // 2, (bh - H) // 2
-    r = np.asarray(big.crop((ox, oy, ox + W, oy + H)), np.float32)[..., 0]
-    sw, sh = int(W / s), int(H / s)
-    sml = base.resize((sw, sh), Image.BILINEAR).resize((W, H), Image.BILINEAR)
-    b = np.asarray(sml, np.float32)[..., 2]
-    canvas[..., 0] = r / 255.0
-    canvas[..., 2] = b / 255.0
-    return canvas
+def _build_lut(shadow, highlight, scurve, gamma, gain, toe):
+    x = np.linspace(0.0, HDR_MAX, _LUT_N, dtype=np.float64) * gain
+    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14          # ACES filmic fit
+    base = np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+    if toe > 0:                      # soft knee that puts real black back in
+        base = base * (base / (base + toe))
+    out = np.empty((_LUT_N, 3), np.uint8)
+    for i in range(3):
+        v = base + shadow[i] * (1.0 - base) ** 2.2 + highlight[i] * base**2.0
+        v = v + scurve * (v - 0.5) * (1.0 - np.abs(2.0 * v - 1.0))
+        v = np.clip(v, 0.0, 1.0) ** gamma
+        out[:, i] = np.clip(v * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return [np.ascontiguousarray(out[:, i]) for i in range(3)]
 
 
-def grain(canvas, amount, rng, down=3):
-    if amount <= 0.0005:
-        return canvas
-    h, w = H // down, W // down
-    n = rng.integers(0, 256, size=(h, w), dtype=np.uint8)
-    up = np.asarray(Image.fromarray(n).resize((W, H), Image.BILINEAR), np.float32)
-    canvas += (up / 255.0 - 0.5)[..., None] * amount
-    return canvas
+def display(canvas,
+            shadow=(-0.006, 0.001, 0.015),
+            highlight=(0.022, 0.006, -0.020),
+            scurve=0.095, gamma=1.0, gain=1.0, toe=0.030):
+    """HDR float -> graded 8-bit RGB in one 12-bit per-channel table lookup.
+
+    Folds the filmic tone curve, split toning (cool shadows / warm highlights)
+    and the contrast S-curve into a single cached LUT, so the whole grade is
+    cheaper than the plain Reinhard tonemap it replaces.
+    """
+    key = (shadow, highlight, round(scurve, 4), round(gamma, 4),
+           round(gain, 4), round(toe, 4))
+    lut = _lut_cache.get(key)
+    if lut is None:
+        lut = _build_lut(shadow, highlight, scurve, gamma, gain, toe)
+        _lut_cache[key] = lut
+    np.clip(canvas, 0.0, HDR_MAX - 1e-3, out=canvas)
+    canvas *= np.float32((_LUT_N - 1) / HDR_MAX)
+    idx = canvas.astype(np.uint16)
+    out = np.empty((H, W, 3), np.uint8)
+    np.take(lut[0], idx[..., 0], out=out[..., 0])
+    np.take(lut[1], idx[..., 1], out=out[..., 1])
+    np.take(lut[2], idx[..., 2], out=out[..., 2])
+    return out
+
+
+def warp_ca(u8, zoom=1.0, dx=0.0, dy=0.0, ca=1.0, rot=0.0):
+    """Camera zoom/pan (+ optional roll) fused with chromatic aberration.
+
+    Each channel is resampled at a marginally different scale, which is exactly
+    what a real lens does — so the camera move and the CA cost one pass, not two.
+    """
+    if (abs(zoom - 1.0) < 2e-4 and abs(dx) < 0.12 and abs(dy) < 0.12
+            and ca < 0.12 and abs(rot) < 1e-3):
+        return u8
+    img = Image.fromarray(u8)
+    if abs(rot) >= 1e-3:
+        img = img.rotate(rot, resample=Image.BILINEAR)
+    z0 = max(zoom, 1.0 + (abs(dx) + abs(dy)) / 460.0)
+    chans = img.split()
+    out = []
+    for i in range(3):
+        z = z0 * (1.0 + (1 - i) * ca / 1700.0)
+        nw = max(W + 2, int(round(W * z)))
+        nh = max(H + 2, int(round(H * z)))
+        ox = int(round((nw - W) * 0.5 + dx))
+        oy = int(round((nh - H) * 0.5 + dy))
+        ox = max(0, min(nw - W, ox))
+        oy = max(0, min(nh - H, oy))
+        out.append(chans[i].resize((nw, nh), Image.BILINEAR).crop((ox, oy, ox + W, oy + H)))
+    return np.asarray(Image.merge("RGB", out))
+
+
+def grain_u8(u8, amount=0.030, rng=None, down=3, floor=0.24):
+    """Luminance-weighted film grain: strongest in the midtones, present but
+    restrained in blacks, almost gone in clipped highlights."""
+    if amount <= 0.0008:
+        return u8
+    hs, ws = H // down, W // down
+    sm = u8[::down, ::down].max(axis=2).astype(np.float32)
+    n = rng.random((hs, ws), dtype=np.float32)
+    n -= 0.5
+    wgt = sm * np.float32(2.0 / 255.0)
+    wgt -= 1.0
+    np.abs(wgt, out=wgt)
+    np.subtract(1.0, wgt, out=wgt)
+    wgt += np.float32(floor)
+    n *= wgt
+    n *= np.float32(amount * 255.0)
+    n += 128.0
+    g = Image.fromarray(np.clip(n, 0, 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+    gi = np.asarray(g, np.int16)
+    gi -= 128
+    r = u8.astype(np.int16)
+    r += gi[..., None]
+    np.clip(r, 0, 255, out=r)
+    return r.astype(np.uint8)
 
 
 def exposure(canvas, ev=0.0, contrast=1.0, lift=0.0):
@@ -576,16 +689,61 @@ def exposure(canvas, ev=0.0, contrast=1.0, lift=0.0):
     return canvas
 
 
-def tonemap(canvas, shoulder=0.95):
-    """Soft filmic roll-off (Reinhard-Jodie style) so bloom never clips hard."""
-    np.maximum(canvas, 0.0, out=canvas)
-    num = canvas * np.float32(1.0 / (shoulder * shoulder))
-    num += 1.0
-    num *= canvas
-    den = canvas + 1.0
-    np.divide(num, den, out=canvas)
+def to_u8(canvas):
+    return np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+# ==========================================================================
+# atmosphere
+# ==========================================================================
+_mote_cache: dict = {}
+
+
+def motes(canvas, t, n=118, gain=0.20, accent=None, seed=11, down=4, speed=1.0,
+          drift=1.0):
+    """Parallax bokeh dust.
+
+    Drawn at 1/`down` resolution and bilinearly upsampled, so the upsample
+    itself supplies the defocus — near motes land large and soft, far ones
+    stay tight.  Gives every shot a sense of volume for ~20 ms.
+    """
+    key = (n, seed)
+    P = _mote_cache.get(key)
+    if P is None:
+        r = np.random.default_rng(seed)
+        P = (r.random(n).astype(np.float32),
+             r.random(n).astype(np.float32),
+             (0.10 + r.random(n).astype(np.float32) ** 2.6 * 0.90),
+             r.random(n).astype(np.float32) * 6.2832,
+             r.random(n) < 0.26)
+        _mote_cache[key] = P
+    x0, y0, dep, ph, is_acc = P
+    sw, sh = W // down, H // down
+    img = Image.new("RGB", (sw, sh), (0, 0, 0))
+    dr = ImageDraw.Draw(img)
+    acc = accent or CRIMSON
+    spanx = sw + 40.0
+    for i in range(n):
+        d = float(dep[i])
+        x = (x0[i] * spanx + t * (4.0 + 24.0 * d) * speed) % spanx - 20.0
+        y = y0[i] * sh + math.sin(t * (0.3 + 0.5 * d) + ph[i]) * 6.5 * d * drift
+        v = (0.16 + 0.84 * d) * (0.46 + 0.54 * math.sin(t * 1.55 + ph[i] * 2.3))
+        if v <= 0.03:
+            continue
+        rad = 0.42 + d * 1.45
+        c = acc if is_acc[i] else (212, 222, 240)
+        dr.ellipse((x - rad, y - rad, x + rad, y + rad),
+                   fill=(int(c[0] * v), int(c[1] * v), int(c[2] * v)))
+    img = img.filter(ImageFilter.GaussianBlur(0.9)).resize((W, H), Image.BILINEAR)
+    np.add(canvas, np.asarray(img, np.float32) * np.float32(gain / 255.0), out=canvas)
     return canvas
 
 
-def to_u8(canvas):
-    return np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
+def smear(u8, px):
+    """Horizontal directional blur (squeeze / stretch box filter)."""
+    if px < 2.0:
+        return u8
+    k = min(48, max(2, int(px)))
+    img = Image.fromarray(u8)
+    return np.asarray(
+        img.resize((max(8, W // k), H), Image.BILINEAR).resize((W, H), Image.BILINEAR))

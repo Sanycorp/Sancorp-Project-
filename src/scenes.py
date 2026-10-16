@@ -48,7 +48,7 @@ def slam(lt, t0, dur=0.42, s0=2.7):
 
 
 def backdrop(canvas, t, accent=ACC, wash=0.26, grid_a=0.85, drift=1.0,
-             step=60, wash_y=None, kind="dots"):
+             step=60, wash_y=None, kind="dots", dust=0.20):
     canvas[:] = np.asarray(E.BG, np.float32) / 255.0
     if wash > 0:
         canvas += E.radial_wash(accent, CX, wash_y if wash_y is not None else CY + 210,
@@ -64,6 +64,8 @@ def backdrop(canvas, t, accent=ACC, wash=0.26, grid_a=0.85, drift=1.0,
         oy = int((t * 6.0 * drift) % sp)
         view = g[oy:oy + H, ox:ox + W]
         np.add(canvas, view * np.float32(grid_a), out=canvas)
+    if dust > 0:
+        E.motes(canvas, t, gain=dust, accent=accent, drift=drift)
     return canvas
 
 
@@ -92,6 +94,19 @@ def knockout_disc(canvas, wordlayer, cx, cy, r, fill=ACC, ink=(14, 7, 10)):
     disc = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     dd = ImageDraw.Draw(disc)
     dd.ellipse((0, 0, size - 1, size - 1), fill=fill + (255,))
+
+    # keep the fill from reading as dead flat vector: a raking sheen plus
+    # very fine scanlines, both clipped to the disc later by the alpha mask
+    sheen = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ds = ImageDraw.Draw(sheen)
+    for yy in range(0, size, 3):
+        ds.line([(0, yy), (size, yy)], fill=(0, 0, 0, 16), width=1)
+    for i in range(14):
+        a = int(13 * (1.0 - i / 14.0))
+        ds.ellipse((-size * 0.55 + i * 7, -size * 0.40 + i * 9,
+                    size * 0.62 + i * 7, size * 1.25 + i * 9),
+                   outline=(255, 255, 255, a), width=9)
+    disc.alpha_composite(sheen)
 
     crop = wordlayer.crop((x0, y0, x0 + size, y0 + size))
     dark = Image.new("RGBA", (size, size), ink + (255,))
@@ -162,7 +177,7 @@ def _hook_layout():
 
 def scene_hook(canvas, lt, t, fx, rng):
     partB = lt >= 4.0
-    hits = [0.5, 1.0, 1.5, 2.0] if not partB else [4.5, 5.0, 5.5]
+    hits = [0.5, 1.0, 1.5, 2.0] if not partB else [4.08, 4.58, 5.08]
     imp = impact(lt, hits, 0.20)
     fx["chroma"] = max(fx["chroma"], imp * 9.0)
     fx["shake"] = max(fx["shake"], imp * 7.0)
@@ -231,9 +246,9 @@ def scene_hook(canvas, lt, t, fx, rng):
 
     else:
         # ---------------- part B ----------------
-        lines = [("IT'S A", 104, 356, E.BONE, 4.5),
-                 ("MOTION", 232, 512, E.WHITE, 5.0),
-                 ("DESIGNER.", 232, 724, ACC, 5.5)]
+        lines = [("IT'S A", 104, 356, E.BONE, 4.08),
+                 ("MOTION", 232, 512, E.WHITE, 4.58),
+                 ("DESIGNER.", 232, 724, ACC, 5.08)]
         for txt, sz, y, col, t0 in lines:
             if lt < t0:
                 continue
@@ -243,14 +258,14 @@ def scene_hook(canvas, lt, t, fx, rng):
             if col == ACC and p > 0.3:
                 E.place(glow, img, CX, y, sc, 0, 0.5)
 
-        if lt >= 6.0:
-            u = span(lt, 6.0, 6.5, out_expo)
+        if lt >= 5.7:
+            u = span(lt, 5.7, 6.2, out_expo)
             lw = 760 * u
             d = ImageDraw.Draw(base)
             d.rectangle((CX - lw / 2, 836, CX + lw / 2, 842), fill=ACC + (255,))
             k = E.text_img("POWERED BY CLAUDE  //  MCP", MONO_B, 28,
                            (178, 184, 198), tracking=6.5)
-            E.place(base, k, CX, 896, 1.0, 0, span(lt, 6.3, 6.9, out_cubic))
+            E.place(base, k, CX, 896, 1.0, 0, span(lt, 6.0, 6.6, out_cubic))
 
         sweep_streak(glow, span(lt, 6.6, 7.3, in_out_cubic), alpha=0.42)
         if lt >= 7.4:
@@ -853,12 +868,101 @@ def scene_montage(canvas, lt, t, fx, rng):
 _SPECS = ["1920 x 1080", "60 FPS", "H.264", "MCP DRIVEN"]
 
 
+# --------------------------------------------------------------------------
+_SPH: dict = {}
+
+
+def wire_core(layer_, cx, cy, r, t, alpha=1.0, accent=ACC, rings=7, seg=46):
+    """A perspective-projected rotating wire sphere.
+
+    Latitude rings plus a Fibonacci point shell, depth-sorted so the far side
+    dims and thins exactly as it would under a real lens.  Pure arithmetic —
+    no 3D library, no z-buffer, about 3 ms a frame.
+    """
+    if alpha <= 0.01:
+        return
+    key = ("pts", rings, seg)
+    P = _SPH.get(key)
+    if P is None:
+        lat = []
+        for i in range(1, rings + 1):
+            phi = math.pi * i / (rings + 1)
+            sp, cp = math.sin(phi), math.cos(phi)
+            lat.append([(sp * math.cos(2 * math.pi * j / seg),
+                         cp,
+                         sp * math.sin(2 * math.pi * j / seg)) for j in range(seg + 1)])
+        for m in range(8):                      # meridians: these are what
+            th = math.pi * m / 8.0              # actually read as "sphere"
+            ct, st = math.cos(th), math.sin(th)
+            lat.append([(math.sin(math.pi * j / seg) * ct,
+                         math.cos(math.pi * j / seg),
+                         math.sin(math.pi * j / seg) * st) for j in range(seg + 1)])
+        n = 128
+        ga = math.pi * (3.0 - math.sqrt(5.0))
+        shell = []
+        for i in range(n):
+            y = 1.0 - 2.0 * i / (n - 1.0)
+            rr = math.sqrt(max(0.0, 1.0 - y * y))
+            th = ga * i
+            shell.append((math.cos(th) * rr, y, math.sin(th) * rr))
+        P = (lat, shell)
+        _SPH[key] = P
+    lat, shell = P
+
+    ay = t * 0.42
+    ax = 0.30 + math.sin(t * 0.23) * 0.16
+    cay, say = math.cos(ay), math.sin(ay)
+    cax, sax = math.cos(ax), math.sin(ax)
+    d = ImageDraw.Draw(layer_)
+
+    def proj(p):
+        x, y, z = p
+        x, z = x * cay + z * say, -x * say + z * cay
+        y, z = y * cax - z * sax, y * sax + z * cax
+        k = 2.6 / (2.6 + z)                      # perspective divide
+        return cx + x * r * k, cy + y * r * k, z
+
+    for ring in lat:
+        pts, prev = [], None
+        for p in ring:
+            X, Y, Z = proj(p)
+            if prev is not None and Z * prev > 0:
+                pts.append((X, Y))
+            else:
+                if len(pts) > 1:
+                    dep = 0.5 - prev * 0.5
+                    d.line(pts, width=1, joint="curve",
+                           fill=accent + (int(alpha * (34 + 104 * dep)),))
+                pts = [(X, Y)]
+            prev = Z
+        if len(pts) > 1:
+            d.line(pts, width=1, joint="curve",
+                   fill=accent + (int(alpha * (34 + 104 * (0.5 - prev * 0.5))),))
+
+    for p in shell:
+        X, Y, Z = proj(p)
+        dep = 0.5 - Z * 0.5                       # 1 = near, 0 = far
+        rad = 0.7 + dep * 1.9
+        a = int(alpha * (22 + 196 * dep ** 2.2))
+        if a < 4:
+            continue
+        col = E.BONE if (dep > 0.72) else accent
+        d.ellipse((X - rad, Y - rad, X + rad, Y + rad), fill=col + (a,))
+
+
 def scene_outro(canvas, lt, t, fx, rng):
     backdrop(canvas, t, wash=0.16 + pulse(lt, 0.4, 1.4, hold=0.3) * 0.22,
              grid_a=span(lt, 0.6, 1.6) * 0.7, wash_y=CY + 40, drift=0.5)
 
     base = E.layer()
     glow = E.layer()
+
+    # slowly rotating data core behind the wordmark
+    core_a = span(lt, 0.5, 2.4, out_cubic) * (1.0 - span(lt, 6.4, 7.6, in_quad))
+    if core_a > 0.01:
+        wire_core(base, CX, CY - 24, 336 + 22 * math.sin(lt * 0.5), t,
+                  alpha=core_a)
+
     d = ImageDraw.Draw(base)
 
     # opening light seam

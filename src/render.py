@@ -24,7 +24,8 @@ from PIL import Image
 import engine as E
 import scenes as S
 import widgets as Wg
-from engine import H, W, FPS, clamp, mix, span, in_quad, out_cubic
+from engine import (H, W, FPS, clamp, mix, span, in_quad, in_out_cubic,
+                    out_cubic)
 
 import imageio_ffmpeg
 
@@ -40,18 +41,34 @@ def _scene_at(t):
     return 0, 0.0, 1.0, S.TIMELINE[0][2], True
 
 
-def zoom_shake(canvas, z, sx, sy):
-    if abs(z - 1.0) < 1e-4 and abs(sx) < 0.2 and abs(sy) < 0.2:
-        return canvas
-    z = max(z, 1.0 + (abs(sx) + abs(sy)) / 420.0)
-    img = Image.fromarray(E.to_u8(canvas))
-    nw, nh = int(W * z), int(H * z)
-    img = img.resize((nw, nh), Image.BICUBIC)
-    ox = int((nw - W) / 2 + sx)
-    oy = int((nh - H) / 2 + sy)
-    ox = max(0, min(nw - W, ox))
-    oy = max(0, min(nh - H, oy))
-    return np.asarray(img.crop((ox, oy, ox + W, oy + H)), np.float32) / 255.0
+# --------------------------------------------------------------------------
+# virtual camera
+#
+# Nothing in the film is ever perfectly locked off.  Every scene gets a slow
+# push or pull, the whole frame breathes, and a three-octave weave adds
+# sub-pixel handheld life.  Impact shake and zoom punches ride on top.
+# --------------------------------------------------------------------------
+PUSH_AMP = 0.021
+SMEAR_IN = 0.10
+SMEAR_OUT = 0.07
+WEAVE_X = 1.7
+WEAVE_Y = 1.4
+
+
+def camera(t, idx, lt, dur, fx):
+    phase = clamp(lt / max(dur, 1e-3))
+    # alternate push-in / pull-out so consecutive scenes never feel identical
+    k = phase if (idx % 2 == 0) else (1.0 - phase)
+    z = 1.0 + PUSH_AMP * in_out_cubic(k)
+    z *= 1.0 + 0.0035 * math.sin(t * 0.78 + idx * 1.7)      # breathing
+    z = max(1.0, z * fx["zoom"])
+
+    hx = (math.sin(t * 1.70 + 1.3) + math.sin(t * 3.13 + 0.4) * 0.45
+          + math.sin(t * 5.90 + 2.2) * 0.22) * WEAVE_X
+    hy = (math.cos(t * 1.41 + 0.7) + math.cos(t * 2.71 + 1.9) * 0.40
+          + math.cos(t * 6.29 + 0.2) * 0.18) * WEAVE_Y
+    sx, sy = E.shake(idx + 1, fx["shake"], t)
+    return z, hx + sx, hy + sy
 
 
 def make_frame(fi: int) -> np.ndarray:
@@ -74,12 +91,9 @@ def make_frame(fi: int) -> np.ndarray:
 
     S.glitch(canvas, fx["glitch"], rng)
 
-    sx, sy = E.shake(idx + 1, fx["shake"], t)
-    canvas = zoom_shake(canvas, fx["zoom"], sx, sy)
-
-    canvas = E.chroma(canvas, fx["chroma"])
-    canvas = E.bloom(canvas, thresh=0.60, strength=0.50, radius=9.0)
-    canvas = E.lens(canvas, vig=0.60, scan=0.035)
+    canvas = E.glow(canvas, thresh=0.54, strength=0.40, radius=5.0,
+                    ana=0.40 + fx.get("ana", 0.0))
+    canvas = E.lens(canvas, vig=0.60, scan=0.035, cool=0.06)
 
     if hud_on:
         ha = span(t, a + 0.25, a + 0.9, out_cubic) * (1.0 - span(t, b - 0.45, b, in_quad))
@@ -89,9 +103,24 @@ def make_frame(fi: int) -> np.ndarray:
     if fx["flash"] > 0.002:
         canvas += fx["flash"]
 
-    canvas = E.grain(canvas, 0.030, rng)
-    canvas = E.tonemap(canvas, 0.95)
-    return E.to_u8(canvas)
+    u8 = E.display(canvas)
+    z, dx, dy = camera(t, idx, lt, b - a, fx)
+    u8 = E.warp_ca(u8, z, dx, dy, ca=1.05 + fx["chroma"] * 0.55)
+
+    # whip cut: the frames either side of a boundary smear and slide, so the
+    # edit reads as a camera snapping across rather than a video switcher
+    sm = 0.0
+    if idx > 0 and lt < SMEAR_IN:
+        sm = (1.0 - lt / SMEAR_IN) ** 1.5
+    if idx < len(S.TIMELINE) - 1 and (b - t) < SMEAR_OUT:
+        sm = max(sm, (1.0 - (b - t) / SMEAR_OUT) ** 1.5 * 0.72)
+    if sm > 0.02:
+        u8 = E.smear(u8, sm * 34.0)
+        slide = int(round(sm * 86.0 * (1 if idx % 2 else -1)))
+        if slide:
+            u8 = np.roll(u8, slide, axis=1)
+
+    return E.grain_u8(u8, 0.030, rng)
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +134,10 @@ def _encode_segment(args):
         "-an",
         "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
         "-pix_fmt", "yuv420p",
-        "-x264-params", "keyint=120:min-keyint=120:scenecut=0:ref=4:bframes=3",
+        "-profile:v", "high", "-level", "4.2",
+        "-x264-params",
+        "keyint=120:min-keyint=120:scenecut=0:ref=4:bframes=3:"
+        "aq-mode=3:aq-strength=0.9:psy-rd=1.0,0.15:deblock=-1,-1",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         out,
     ]
