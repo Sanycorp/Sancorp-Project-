@@ -683,7 +683,12 @@ class PhaseBlackHole(Phase):
         fx = (phi / TAU + 0.5) * w - 0.5
         fx = np.mod(fx, w)
         y0 = fy.astype(np.int32)
-        x0 = fx.astype(np.int32)
+        # np.mod can return exactly w: a longitude a hair below zero maps
+        # to w - epsilon, and in float32 that rounds straight up to w.  The
+        # index is then one past the end of the table, which is how this
+        # crashed a worker forty-two seconds into the film after two hours
+        # of rendering.
+        x0 = np.minimum(fx.astype(np.int32), w - 1)
         y1 = np.minimum(y0 + 1, h - 1)
         x1 = (x0 + 1) % w            # the sky wraps in longitude
         wy = (fy - y0).astype(F32)[:, None]

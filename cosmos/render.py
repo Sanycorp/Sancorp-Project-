@@ -166,6 +166,71 @@ def render_range(width, height, fps, first, last, out_path, crf, preset,
 
 
 # ==========================================================================
+# joining the segments
+# ==========================================================================
+#: PID the mpegts muxer assigns to the first video stream
+VIDEO_PID = 0x0100
+
+
+def join_transport_streams(parts, out_path):
+    """Concatenate segments by unwrapping the transport stream in Python.
+
+    The obvious way to do this is ffmpeg's concat demuxer, and it does not
+    work here: the static ffmpeg build available in this environment
+    segmentation-faults the instant it is asked to *read* an MPEG transport
+    stream, although it writes them perfectly well.  That failure arrives
+    after the entire film has been rendered, which is the worst possible
+    moment, so the join no longer depends on it.
+
+    Transport stream framing is simple enough to undo directly.  The file
+    is a sequence of 188-byte packets, each beginning with the sync byte
+    0x47 and carrying a 13-bit PID.  Packets on the video PID hold the
+    H.264 elementary stream, wrapped in PES packets whose header is nine
+    bytes plus a declared extension.  Stripping the transport and PES
+    layers leaves the raw Annex-B bitstream, and because each segment was
+    encoded independently it begins with its own parameter sets and an IDR
+    picture — so the segments can simply be written one after another.
+
+    Returns the number of access units in the joined stream, counted from
+    the access unit delimiters, which is a direct check that no frame was
+    lost at a junction.
+    """
+    frames = 0
+    with open(out_path, "wb") as out:
+        for part in parts:
+            with open(part, "rb") as fh:
+                while True:
+                    buf = fh.read(188 * 8192)
+                    if not buf:
+                        break
+                    for i in range(0, len(buf) - 187, 188):
+                        pkt = buf[i:i + 188]
+                        if pkt[0] != 0x47:
+                            continue
+                        if (((pkt[1] & 0x1F) << 8) | pkt[2]) != VIDEO_PID:
+                            continue
+                        afc = (pkt[3] >> 4) & 0x3
+                        j = 4
+                        if afc in (2, 3):
+                            # adaptation field: one length byte then that
+                            # many bytes of padding, PCR and flags
+                            j = 5 + pkt[4]
+                            if afc == 2 or j >= 188:
+                                continue
+                        if (pkt[1] >> 6) & 1:
+                            # payload unit start: a PES header follows
+                            if pkt[j:j + 3] != b"\x00\x00\x01":
+                                continue
+                            j = j + 9 + pkt[j + 8]
+                            if j >= 188:
+                                continue
+                        chunk = pkt[j:188]
+                        frames += chunk.count(b"\x00\x00\x00\x01\x09")
+                        out.write(chunk)
+    return frames
+
+
+# ==========================================================================
 # driver
 # ==========================================================================
 #: Measured seconds per frame at 1920x1080, used only to balance the
@@ -285,19 +350,14 @@ def main(argv=None):
     print("penyandian selesai dalam %.1f s · menggabungkan"
           % (time.perf_counter() - t0), flush=True)
 
-    listing = os.path.join(args.tmp, "concat.txt")
-    with open(listing, "w") as fh:
-        for part in parts:
-            fh.write("file '%s'\n" % os.path.abspath(part))
+    joined = os.path.join(args.tmp, "joined.h264")
+    frames = join_transport_streams(parts, joined)
+    print("aliran gabungan: %d frame" % frames, flush=True)
 
     cmd = [ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "concat", "-safe", "0", "-i", listing,
-           "-c", "copy", "-movflags", "+faststart",
-           "-bsf:a", "aac_adtstoasc", args.out]
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        cmd = [c for c in cmd if c not in ("-bsf:a", "aac_adtstoasc")]
-        subprocess.run(cmd, check=True)
+           "-r", str(args.fps), "-f", "h264", "-i", joined,
+           "-c:v", "copy", "-movflags", "+faststart", args.out]
+    subprocess.run(cmd, check=True)
 
     size = os.path.getsize(args.out)
     print("selesai: %s · %.1f MB · %.1f menit total"
