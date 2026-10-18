@@ -273,6 +273,40 @@ def plan_segments(timeline, fps, first, last, workers):
     return out
 
 
+def build_score(wav_path, total, seed=20261018, force=False):
+    """Render the score to ``wav_path`` unless it is already there.
+
+    Kept separate from the picture so a re-render of one does not force a
+    re-render of the other; the score takes under a minute and the film
+    takes two hours.
+    """
+    if (not force) and os.path.exists(wav_path) \
+            and os.path.getsize(wav_path) > 1000:
+        return wav_path
+    from .audio import score as SC
+    os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
+    mix = SC.build(seed=seed, total=total)
+    SC.write_wav(wav_path, mix)
+    return wav_path
+
+
+def mux_audio(video_path, wav_path, out_path, bitrate="320k"):
+    """Attach the score to the picture without re-encoding either stream.
+
+    The video is stream-copied — it has already been through one lossy
+    encode and a second would cost quality for nothing.  The audio is
+    encoded once from the float mix straight to AAC at a high bit rate.
+    """
+    cmd = [ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-y",
+           "-i", video_path, "-i", wav_path,
+           "-map", "0:v:0", "-map", "1:a:0",
+           "-c:v", "copy",
+           "-c:a", "aac", "-b:a", bitrate, "-ar", "48000", "-ac", "2",
+           "-movflags", "+faststart", "-shortest", out_path]
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="render the cosmic sequence")
     ap.add_argument("--width", type=int, default=1920)
@@ -287,6 +321,10 @@ def main(argv=None):
     ap.add_argument("--start", type=float, default=None,
                     help="first film second to render (for previews)")
     ap.add_argument("--stop", type=float, default=None)
+    ap.add_argument("--audio", default="auto",
+                    help="'auto' builds the score and muxes it, 'none' "
+                         "leaves the film silent, or a path to a WAV")
+    ap.add_argument("--audio-bitrate", default="320k")
     args = ap.parse_args(argv)
 
     from .timeline import Timeline, build_phases
@@ -358,6 +396,18 @@ def main(argv=None):
            "-r", str(args.fps), "-f", "h264", "-i", joined,
            "-c:v", "copy", "-movflags", "+faststart", args.out]
     subprocess.run(cmd, check=True)
+
+    if args.audio and args.audio != "none":
+        wav = args.audio
+        if wav == "auto":
+            wav = os.path.join(ROOT, "out", "kosmik_score.wav")
+            print("membangun skor ...", flush=True)
+            build_score(wav, tl.total)
+        silent = args.out[:-4] + "_silent.mp4"
+        os.replace(args.out, silent)
+        print("memasang skor ...", flush=True)
+        mux_audio(silent, wav, args.out, args.audio_bitrate)
+        os.remove(silent)
 
     size = os.path.getsize(args.out)
     print("selesai: %s · %.1f MB · %.1f menit total"
