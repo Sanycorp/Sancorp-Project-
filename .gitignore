@@ -14,3 +14,4 @@ out/*.wav
 # cosmic sequence master (180 MB; delivered via Drive, not via git)
 out/cosmos_1080p60.mp4
 out/sancorp_kosmik_1080p60.mp4
+out/kosmik_score.wav
