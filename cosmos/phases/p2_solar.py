@@ -720,7 +720,7 @@ class SurfaceRenderer:
 
         # fine storm texture, strongest in the belts
         storm = np.clip(warp2 * F32(2.0) + F32(0.5), 0.0, 1.0)
-        rgb *= (F32(0.80) + F32(0.40) * storm)[:, None]
+        rgb *= (F32(0.70) + F32(0.62) * storm)[:, None]
 
         # polar hoods are darker and bluer
         hood = np.clip((np.abs(lat) - F32(0.70)) * F32(3.0), 0.0, 1.0)
@@ -872,9 +872,16 @@ class SurfaceRenderer:
                                  ) * F32(0.88)      # Cassini Division
         tau *= F32(1.0) - np.exp(-((u - F32(0.885)) / F32(0.012)) ** 2
                                  ) * F32(0.80)      # Encke gap
+        # Fine ringlet structure.  Saturn's rings are not three smooth
+        # annuli but thousands of ringlets, carved by density waves at
+        # resonances with the inner moons; the radial power spectrum is
+        # what gives the rings their grooved, phonographic look.
+        ringlets = (np.sin(u * F32(430.0)) * F32(0.19)
+                    + np.sin(u * F32(167.0) + F32(1.7)) * F32(0.15)
+                    + np.sin(u * F32(61.0) + F32(0.4)) * F32(0.11))
         grain = self._noise(self.v_fine, hp - pos[None, :].astype(F32),
                             900.0)
-        tau *= F32(1.0) + grain * F32(0.55)
+        tau *= F32(1.0) + grain * F32(0.42) + ringlets
         alpha = F32(1.0) - np.exp(-np.maximum(tau, 0.0) * F32(1.5))
 
         # illumination: ring particles scatter forward strongly
@@ -893,9 +900,16 @@ class SurfaceRenderer:
             blocked = (disc > 0.0) & (b < 0.0)
             shadow = np.where(blocked, F32(0.06), shadow)
 
-        ice = np.asarray((0.96, 0.90, 0.78), F32)[None, :]
-        tint = np.clip(u * F32(1.2), 0.0, 1.0)[:, None]
-        col = ice * (F32(0.72) + F32(0.40) * tint)
+        # The C ring is darker and greyer than the B ring, which is the
+        # cleanest water ice in the solar system; the A ring is in
+        # between.  Tint follows the optical depth rather than the radius
+        # alone, because the two are physically the same thing.
+        ice = np.asarray((0.98, 0.93, 0.80), F32)[None, :]
+        dirty = np.asarray((0.62, 0.58, 0.55), F32)[None, :]
+        purity = np.clip(tau * F32(0.9), 0.0, 1.0)[:, None]
+        col = dirty + (ice - dirty) * purity
+        col = col * (F32(0.70) + F32(0.45) * np.clip(
+            u * F32(1.2), 0.0, 1.0)[:, None])
         rgb = col * (incl * shadow * irr * F32(1.5))[:, None]
 
         # composite with depth: rings are translucent, so blend rather than
@@ -919,11 +933,24 @@ class SurfaceRenderer:
         much of the lit hemisphere is actually turned toward us, which is
         why Venus is brightest as a crescent and not when full.
         """
-        d_sun = float(np.linalg.norm(pos - sun_pos))
         d_cam = float(np.linalg.norm(pos - eye))
-        if d_sun < 1e-9 or d_cam < 1e-9:
+        if d_cam < 1e-9:
             return None
         r = body.radius_au
+        if body.emissive > 0.0:
+            # The Sun does not reflect, it radiates, so it must be handled
+            # before the Sun-distance guard below: its own distance to
+            # itself is zero and the reflected-light branch would divide
+            # by it.  Leaving the guard first made the Sun vanish from
+            # every frame in which it was smaller than a pixel, which is
+            # most of the opening wide shot.
+            flux = (r * r) / (d_cam * d_cam) * 6.0e4
+            col = np.asarray(S.blackbody_lut(
+                np.array([body.base_temp], F32))[0], np.float64)
+            return (col * flux).astype(F32)
+        d_sun = float(np.linalg.norm(pos - sun_pos))
+        if d_sun < 1e-9:
+            return None
         to_sun = (sun_pos - pos) / d_sun
         to_cam = (eye - pos) / d_cam
         cos_phase = float(np.clip(to_sun @ to_cam, -1.0, 1.0))
@@ -932,12 +959,6 @@ class SurfaceRenderer:
         phi = ((math.pi - phase_ang) * math.cos(phase_ang)
                + math.sin(phase_ang)) / math.pi
         alb = np.asarray(body.albedo, np.float64)
-        if body.emissive > 0.0:
-            # the Sun does not reflect; it radiates
-            flux = (r * r) / (d_cam * d_cam) * 6.0e4
-            col = np.asarray(S.blackbody_lut(np.float32(body.base_temp))[0],
-                             np.float64)
-            return (col * flux).astype(F32)
         flux = alb * (r * r) / (d_sun * d_sun * d_cam * d_cam) * phi
         return flux.astype(F32)
 
@@ -1010,7 +1031,7 @@ class PhaseSolarSystem(Phase):
 
     def _build_background(self):
         rng = np.random.default_rng(self.seed + 4242)
-        n = 32000
+        n = 120000
         dirs = V.fibonacci_sphere(n).astype(F32)
         dirs = dirs[rng.permutation(n)]
         pos = dirs * F32(4000.0)
@@ -1018,7 +1039,7 @@ class PhaseSolarSystem(Phase):
                     ).astype(F32)
         rgb = S.saturate_rgb(S.blackbody_lut(t), 1.55)
         rgb /= np.maximum(S.luminance(rgb), 1e-5)[:, None]
-        b = (rng.random(n).astype(F32) ** 4.2) * F32(3.4) + F32(0.05)
+        b = (rng.random(n).astype(F32) ** 5.0) * F32(3.4) + F32(0.055)
         self._bg = (pos, (rgb * b[:, None]).astype(F32))
 
     def _build_plan(self):
@@ -1034,7 +1055,7 @@ class PhaseSolarSystem(Phase):
         #  shot frames the whole system rather than any one object.
         self._plan = [
             Shot(0.00, 0.22, "Sun", (-0.30, 0.44, -0.85),
-                 74.0, 46.0, 52.0, absolute_au=True, ev=1.0),
+                 24.0, 12.5, 52.0, absolute_au=True, ev=1.0),
             Shot(0.22, 0.42, "Saturn", (-0.60, 0.235, -0.765),
                  46.0, 6.4, 46.0, ev=13.0),
             Shot(0.42, 0.58, "Saturn", (0.56, 0.115, -0.82),
@@ -1150,12 +1171,12 @@ class PhaseSolarSystem(Phase):
                                    mu_sun)
             if el is None:
                 continue
-            pts, nu = sample_orbit(el, sun, n=620)
+            pts, nu = sample_orbit(el, sun, n=1500)
             # fade by angular distance behind the body
             dnu = np.mod(el["nu"] - nu, TAU) / TAU
             fade = (F32(0.08) + F32(0.92) * (1.0 - dnu) ** 3).astype(F32)
             col = np.asarray(tint, F32)[None, :] * fade[:, None]
-            col *= F32(0.052 * gain * exposure)
+            col *= F32(0.30 * gain * exposure)
             b, _ = project_and_splat(cam, pts.astype(F32), col,
                                      ctx.width, ctx.height,
                                      falloff=False, size_scale=0.0)
@@ -1283,7 +1304,7 @@ class PhaseSolarSystem(Phase):
 
         bgpos, bgrgb = self._bg
         bb, _ = project_and_splat(cam, bgpos + cam.eye.astype(F32),
-                                  bgrgb * F32(0.12 + 0.015 * exposure),
+                                  bgrgb * F32(0.40 + 0.020 * exposure),
                                   ctx.width, ctx.height, falloff=False)
         img += bb.reshape(ctx.height, ctx.width, 3)
 

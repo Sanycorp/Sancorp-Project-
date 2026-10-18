@@ -662,16 +662,30 @@ class Photosphere:
         spot *= F32(1.0) + pen_tex * F32(0.55) * (penumbra - umbra)
 
         # --- limb darkening -----------------------------------------------
-        # I(mu)/I(0) = 1 - u(1 - mu), the Eddington grey result; u = 0.6 is
-        # the solar value in the visible.  The physical cause is that a
-        # slanted line of sight reaches optical depth unity higher up,
-        # where the gas is cooler.
+        # I(mu)/I(0) = 1 - u(1 - mu), the Eddington grey result.  The
+        # physical cause is that a slanted line of sight reaches optical
+        # depth unity higher in the atmosphere, where the gas is cooler.
+        #
+        # The coefficient is strongly wavelength dependent, and that is
+        # the whole reason the limb of the Sun looks orange while its
+        # centre looks white.  The Planck function is steeper in the
+        # ultraviolet than the infrared, so the same drop in temperature
+        # costs blue light far more than red: measured values run from
+        # about 0.50 at 670 nm to 0.78 at 430 nm.  Applied as a single
+        # grey coefficient the limb merely dims; applied per channel it
+        # reddens, which is what the eye recognises as a star.
         mu = np.abs(np.einsum('ij,ij->i', dirs, view_dir))
-        limb = F32(1.0) - F32(0.62) * (F32(1.0) - mu)
+        one_mu = F32(1.0) - mu
+        limb_rgb = np.empty((mu.shape[0], 3), F32)
+        limb_rgb[:, 0] = F32(1.0) - F32(0.50) * one_mu
+        limb_rgb[:, 1] = F32(1.0) - F32(0.63) * one_mu
+        limb_rgb[:, 2] = F32(1.0) - F32(0.78) * one_mu
+        np.maximum(limb_rgb, F32(0.012), out=limb_rgb)
+        limb = limb_rgb[:, 1]
 
         # --- temperature and colour ----------------------------------------
-        temp = F32(T_EFF) * (F32(1.0) + mottle * F32(0.085))
-        temp *= F32(1.0) - spot * F32(0.30)
+        temp = F32(T_EFF) * (F32(1.0) + mottle * F32(0.098))
+        temp *= F32(1.0) - spot * F32(0.32)
         temp *= np.power(np.maximum(limb, F32(0.02)), F32(0.25))
 
         for fl in flares:
@@ -680,15 +694,15 @@ class Photosphere:
             if amp:
                 pass    # surface flare ribbons are added by the caller
 
-        rgb = S.blackbody_lut(temp)
-        # Stefan-Boltzmann: radiated power goes as T^4, so an 8 per cent
-        # temperature modulation is a 36 per cent brightness modulation.
-        # Applying it here is what makes granulation read as convection
-        # rather than as a decal.
+        rgb = S.saturate_rgb(S.blackbody_lut(temp), 1.42)
+        # Stefan-Boltzmann: radiated power goes as T^4, so a ten per cent
+        # temperature modulation is a forty-six per cent brightness
+        # modulation.  Applying it here is what makes granulation read as
+        # convection rather than as a decal.
         rel = temp / F32(T_EFF)
         power = rel * rel
         power = power * power
-        return rgb * (power * limb * F32(0.46))[:, None]
+        return rgb * limb_rgb * (power * F32(1.45))[:, None]
 
 
 # ==========================================================================
@@ -800,8 +814,8 @@ class PhaseSun(Phase):
         u = self.progress(lt, self.duration)
         close = V.smootherstep(0.18, 0.56, u)        # diving in
         out = V.smootherstep(0.62, 1.0, u)           # pulling back
-        ev = 0.62 * (1.0 - close) + 0.30 * close
-        ev = ev * (1.0 - out) + 2.1 * out
+        ev = 0.70 * (1.0 - close) + 0.52 * close
+        ev = ev * (1.0 - out) + 1.85 * out
         return float(ev)
 
     # ----------------------------------------------------------------

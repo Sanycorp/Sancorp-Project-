@@ -219,6 +219,185 @@ def glare(img, threshold=0.78, strength=0.30, levels=5, ana=0.34,
 
 
 # ==========================================================================
+# aperture diffraction
+# ==========================================================================
+def directional_streak(img, angle, taps=7, decay=0.60, step=1.5):
+    """Smear an image along one direction with geometrically spaced taps.
+
+    A single streak of a diffraction star is a line whose intensity falls
+    off roughly exponentially with distance from the source.  Sampling it
+    at *geometrically* spaced offsets — one, two, four, eight pixels and
+    so on — reproduces that profile with a handful of taps instead of the
+    hundreds a uniform line integral would need, because the far part of
+    the streak is both faint and smooth and does not deserve dense
+    sampling.
+    """
+    ca = math.cos(angle)
+    sa = math.sin(angle)
+    acc = np.zeros_like(img)
+    w = 1.0
+    total = 0.0
+    for k in range(taps):
+        off = step * (2.0 ** k)
+        dx = int(round(ca * off))
+        dy = int(round(sa * off))
+        for sgn in (1, -1):
+            sx, sy = dx * sgn, dy * sgn
+            shifted = np.roll(img, (sy, sx), axis=(0, 1))
+            # kill the wrap-around, which would otherwise print a copy of
+            # the opposite edge across the frame
+            if sy > 0:
+                shifted[:sy] = 0.0
+            elif sy < 0:
+                shifted[sy:] = 0.0
+            if sx > 0:
+                shifted[:, :sx] = 0.0
+            elif sx < 0:
+                shifted[:, sx:] = 0.0
+            acc += shifted * F32(w)
+            total += w
+        w *= decay
+    return acc * F32(1.0 / max(total, 1e-6))
+
+
+def starburst(img, blades=6, strength=0.26, threshold=1.6, angle_deg=9.0,
+              taps=7):
+    """Diffraction star from a polygonal iris.
+
+    An aperture with ``n`` straight blades diffracts a point source into
+    ``n`` rays for even ``n`` and ``2n`` for odd ``n``, because opposite
+    edges of an even-bladed iris are parallel and their two rays
+    coincide.  This is the one optical artefact in the chain that is a
+    genuine diffraction phenomenon rather than a scattering or reflection
+    one, and it is the signature that reads instantly as "photographed
+    through a real lens".
+
+    Only the brightest part of the frame contributes: the threshold is
+    well above the glare threshold, so the disc of the black hole and the
+    photosphere of the sun get spikes and the diffuse nebulae do not.
+    """
+    if strength <= 0.0:
+        return img
+    bp = np.maximum(img - F32(threshold), F32(0.0))
+    if float(bp.max()) <= 1e-6:
+        return img
+    small = downsample2(downsample2(bp))
+    rays = blades if blades % 2 == 0 else 2 * blades
+    half = rays // 2
+    acc = np.zeros_like(small)
+    base = math.radians(angle_deg)
+    for i in range(half):
+        acc += directional_streak(small, base + i * math.pi / half,
+                                  taps=taps, decay=0.58)
+    acc *= F32(1.0 / half)
+    # a faint spectral split along the spikes: diffraction is dispersive,
+    # so the outer part of each ray is coloured
+    tint = np.array([1.06, 1.0, 1.12], F32)
+    acc = acc * tint[None, None, :]
+    acc = upsample2(upsample2(acc, (img.shape[0] // 2 + img.shape[0] % 2,
+                                    img.shape[1] // 2 + img.shape[1] % 2,
+                                    3)), img.shape)
+    return img + acc * F32(strength)
+
+
+# ==========================================================================
+# internal reflections
+# ==========================================================================
+def scale_about_centre(img, s):
+    """Resample an image by a signed factor about its centre.
+
+    Negative factors flip it, which is what an internal reflection does:
+    the ghost of a highlight appears on the opposite side of the optical
+    axis.  Separable, so two 1-D gathers rather than a 2-D one.
+    """
+    h, w, _ = img.shape
+    yy = (np.arange(h, dtype=np.float32) - (h - 1) * 0.5) / s + (h - 1) * 0.5
+    xx = (np.arange(w, dtype=np.float32) - (w - 1) * 0.5) / s + (w - 1) * 0.5
+    y0 = np.clip(np.floor(yy), 0, h - 1).astype(np.int32)
+    x0 = np.clip(np.floor(xx), 0, w - 1).astype(np.int32)
+    y1 = np.minimum(y0 + 1, h - 1)
+    x1 = np.minimum(x0 + 1, w - 1)
+    fy = np.clip(yy - y0, 0.0, 1.0).astype(F32)[:, None, None]
+    fx = np.clip(xx - x0, 0.0, 1.0).astype(F32)[None, :, None]
+    rows = img[y0] * (1.0 - fy) + img[y1] * fy
+    out = rows[:, x0] * (1.0 - fx) + rows[:, x1] * fx
+    # anything that came from outside the source frame must be dark
+    inside_y = ((yy >= 0) & (yy <= h - 1)).astype(F32)[:, None, None]
+    inside_x = ((xx >= 0) & (xx <= w - 1)).astype(F32)[None, :, None]
+    return out * inside_y * inside_x
+
+
+#: Ghost specification: (scale, tint, weight).  Negative scales are
+#: reflections through the optical axis, positive ones are the
+#: same-side ghosts that a cemented doublet produces.  The values are
+#: the usual photographic set — a tight warm ghost close in, a large
+#: cool one spread across the opposite quadrant, and a faint ring.
+GHOSTS = (
+    (-0.42, (1.00, 0.72, 0.48), 0.55),
+    (-0.86, (0.52, 0.78, 1.00), 0.38),
+    (-1.55, (0.72, 1.00, 0.80), 0.22),
+    (0.63, (1.00, 0.88, 0.66), 0.18),
+)
+
+
+def ghosts(img, strength=0.07, threshold=1.3, specs=GHOSTS):
+    """Internal reflections between lens elements.
+
+    Every air-glass surface reflects a fraction of a per cent of the
+    light that reaches it, and with a dozen elements there are hundreds
+    of two-surface paths.  Each one re-images the bright parts of the
+    scene, usually defocused and almost always displaced through the
+    optical axis.  A single very bright source in a dark field — which is
+    every frame of this film — is the situation in which they are most
+    visible.
+    """
+    if strength <= 0.0:
+        return img
+    bp = np.maximum(img - F32(threshold), F32(0.0))
+    if float(bp.max()) <= 1e-6:
+        return img
+    small = downsample2(downsample2(downsample2(bp)))
+    small = blur(small, 3, passes=2)
+    acc = np.zeros_like(small)
+    for s, tint, w in specs:
+        g = scale_about_centre(small, s)
+        # a ghost is an out-of-focus image of the aperture, never a sharp
+        # one, and the defocus grows with how far the reflection has to
+        # travel; scale it with the magnification
+        g = blur(g, max(2, int(round(2.0 + 2.5 * abs(s)))), passes=2)
+        acc += g * np.asarray(tint, F32)[None, None, :] * F32(w)
+    sh = [(img.shape[0] + 3) // 4, (img.shape[1] + 3) // 4, 3]
+    sh2 = [(img.shape[0] + 1) // 2, (img.shape[1] + 1) // 2, 3]
+    acc = blur(acc, 2, passes=1)
+    acc = blur(upsample2(acc, tuple(sh)), 2, passes=1)
+    acc = blur(upsample2(acc, tuple(sh2)), 2, passes=1)
+    acc = blur(upsample2(acc, img.shape), 2, passes=1)
+    return img + acc * F32(strength)
+
+
+# ==========================================================================
+# highlight rendition
+# ==========================================================================
+def highlight_desaturate(img, start=2.2, hdr_max=HDR_MAX, amount=0.85):
+    """Bleach saturated highlights toward white before the tone curve.
+
+    Film and digital sensors both do this: once one channel saturates,
+    further exposure can only raise the others, so every highlight walks
+    toward white as it clips.  Without it a blue-white region such as the
+    Doppler-boosted limb of the accretion disc clips channel by channel
+    and lands on a flat, electric, obviously-digital blue instead of a
+    hot white core with a blue fringe.
+    """
+    if amount <= 0.0:
+        return img
+    l = luma(img)[:, :, None]
+    t = np.clip((l - F32(start)) / F32(max(hdr_max - start, 1e-3)),
+                0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t) * F32(amount)
+    return img * (1.0 - t) + l * t
+
+
+# ==========================================================================
 # geometric effects
 # ==========================================================================
 def _radial_scale(channel, amount):
@@ -374,7 +553,9 @@ class PostChain:
                  glare_strength=0.30, anamorphic=0.34, halation=0.22,
                  chroma=0.0019, vignette=0.30, saturation=1.12,
                  grain_amount=3.1, gamma=2.2, contrast=1.045,
-                 hdr_max=HDR_MAX):
+                 hdr_max=HDR_MAX, star_strength=0.30, star_blades=6,
+                 star_threshold=1.15, ghost_strength=0.026,
+                 ghost_threshold=1.6, bleach_start=2.1, bleach=0.85):
         self.width = int(width)
         self.height = int(height)
         self.glare_threshold = float(glare_threshold)
@@ -385,16 +566,34 @@ class PostChain:
         self.saturation = float(saturation)
         self.grain_amount = float(grain_amount)
         self.hdr_max = float(hdr_max)
+        self.star_strength = float(star_strength)
+        self.star_blades = int(star_blades)
+        self.star_threshold = float(star_threshold)
+        self.ghost_strength = float(ghost_strength)
+        self.ghost_threshold = float(ghost_threshold)
+        self.bleach_start = float(bleach_start)
+        self.bleach = float(bleach)
         self._vig = vignette_mask(self.height, self.width, vignette)
         self._lut = tone_lut(gamma=gamma, contrast=contrast,
                              hdr_max=self.hdr_max)
 
     def __call__(self, img, rng, fade=1.0, extra_glare=0.0):
         out = np.ascontiguousarray(np.maximum(img, F32(0.0)), F32)
+        # Order matters and follows the light path through a real
+        # camera: diffraction happens at the iris, reflections happen
+        # between the elements behind it, scattering and halation happen
+        # at the sensor, and everything else is development.
+        out = starburst(out, blades=self.star_blades,
+                        strength=self.star_strength,
+                        threshold=self.star_threshold)
+        out = ghosts(out, strength=self.ghost_strength,
+                     threshold=self.ghost_threshold)
         out = glare(out, threshold=self.glare_threshold,
                     strength=self.glare_strength + extra_glare,
                     ana=self.anamorphic, halation=self.halation)
         out = chromatic(out, self.chroma)
+        out = highlight_desaturate(out, self.bleach_start, self.hdr_max,
+                                   self.bleach)
         out = split_tone(out)
         out = saturate(out, self.saturation)
         out *= self._vig[:, :, None]
@@ -405,6 +604,8 @@ class PostChain:
 
 
 __all__ = ["PostChain", "glare", "chromatic", "vignette_mask", "tone_lut",
+           "starburst", "ghosts", "directional_streak", "scale_about_centre",
+           "highlight_desaturate",
            "apply_lut", "saturate", "split_tone", "grain", "blur",
            "box_blur_h", "box_blur_v", "downsample2", "upsample2",
            "bright_pass", "luma", "HDR_MAX", "LUT_N"]

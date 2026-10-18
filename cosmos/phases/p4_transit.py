@@ -103,7 +103,7 @@ class TransitParams:
     beta_max: float = 0.88           # peak speed as a fraction of c
     r_outer: float = 900.0           # how far the shot travels, AU
 
-    n_field_stars: int = 36000
+    n_field_stars: int = 96000
 
 
 def heliosphere_radius(dirs, p: TransitParams):
@@ -362,11 +362,11 @@ class TransitShader:
         # integrates into a flat grey fog across the whole frame no matter
         # how faint it is per unit length.  A shock is a surface; drawing
         # it as a surface is both cheaper and truer.
-        hot = (wind * F32(0.035) + shock * F32(1.30) * shell_tex
+        hot = (wind * F32(0.055) + shock * F32(1.30) * shell_tex
                + sheath * F32(0.055)) * sw
         cold = (wall * F32(0.85) * shell_tex * sw
                 + bow * F32(0.50) * shell_tex * sw
-                + ism * F32(0.22))
+                + ism * F32(0.46))
 
         # The gains below look absurdly small and are not.  One scene
         # unit here is an astronomical unit and the march spans well over a
